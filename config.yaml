@@ -1,0 +1,178 @@
+# Brand Generator Configuration
+# Konfigurace pro generátor neologismů
+
+# Zakázané podřetězce - slova související s dokumenty, soubory, cloudem
+# Tyto substringy činí název popisným a obtížně registrovatelným jako ochrannou známku
+banned_substrings:
+  # Document-related (dokument)
+  - doc
+  - dok
+  - doku
+  - docu
+  - document
+  - dokument
+
+  # File-related (soubor)
+  - file
+  - fajl
+  - soubor
+
+  # Flow/process (tok/proces)
+  - flow
+  - flux
+  - stream
+
+  # Data/storage (data/úložiště)
+  - data
+  - datum
+  - cloud
+  - drive
+  - disk
+  - storage
+  - store
+
+  # Archive (archiv)
+  - archiv
+  - archive
+  - arch
+
+  # Contract/invoice (smlouva/faktura)
+  - contract
+  - kontrakt
+  - smlou
+  - smlouv
+  - faktur
+  - invoice
+  - bill
+
+  # Record/log (záznam)
+  - record
+  - rekord
+  - log
+  - zaznam
+
+  # Paper/scan (papír/sken)
+  - paper
+  - papir
+  - scan
+  - sken
+
+  # Generic tech terms (generické tech termíny)
+  - soft
+  - ware
+  - tech
+  - digi
+  - cyber
+  - smart
+  - auto
+  - sync
+  - hub
+  - box
+  - net
+  - web
+  - app
+  - sys
+  - pro
+  - plus
+  - max
+  - lite
+
+# Vzory pro generování (C = souhláska, V = samohláska)
+patterns:
+  - CVCV      # 4 znaky: Nalo, Rivo
+  - CVCVC     # 5 znaků: Nalos, Rivet
+  - CVCCV     # 5 znaků: Nalvo, Rivka
+  - CVCVCV    # 6 znaků: Nalovi, Riveno
+  - CVCCVC    # 6 znaků: Narvos, Rivton
+  - CVCVCCV   # 7 znaků: Nalovri, Rivenka
+  - CVCCVCV   # 7 znaků: Narvoli, Rifteno
+
+# Délka generovaných názvů
+min_length: 4
+max_length: 8
+
+# Maximální počet souhlásek za sebou (pro vyslovitelnost)
+max_consecutive_consonants: 2
+
+# Souhlásky a samohlásky
+# Některá písmena vynecháváme pro lepší vyslovitelnost v češtině i angličtině
+consonants: bcdfghjklmnprstvz
+# Vynecháno: q, w, x, y (problematické ve většině jazyků)
+
+vowels: aeiou
+
+# Preferované začátky názvů (bonus skóre)
+preferred_starts:
+  - b
+  - c
+  - f
+  - k
+  - l
+  - m
+  - n
+  - r
+  - s
+  - t
+  - v
+  - z
+
+# Problematické kombinace písmen (penalizace)
+problematic_combinations:
+  - xx
+  - qq
+  - ww
+  - yy
+  - kk
+  - zz
+  - ck  # zní příliš anglicky
+  - ph  # zní příliš anglicky
+  - th  # zní příliš anglicky/řecky
+
+# LLM konfigurace
+# Podporovaní provideři:
+#   - anthropic: Claude modely (vyžaduje ANTHROPIC_API_KEY)
+#   - openai: GPT modely (vyžaduje OPENAI_API_KEY)
+#   - ollama: Lokální modely přes Ollama (http://localhost:11434)
+#   - lmstudio: Lokální modely přes LM Studio (http://localhost:1234/v1)
+#   - gemini: Google Gemini modely (vyžaduje GOOGLE_API_KEY)
+llm:
+  provider: gemini
+  model: gemini-2.0-flash
+  # api_key: null  # Použij env proměnnou nebo nastav zde
+  # api_base: null  # Pro Ollama/LM Studio: http://localhost:11434
+  batch_size: 20
+  max_tokens: 4096
+  temperature: 0.3
+
+# Příklady konfigurace pro různé providery:
+#
+# OpenAI:
+# llm:
+#   provider: openai
+#   model: gpt-4o
+#
+# Ollama (lokální):
+# llm:
+#   provider: ollama
+#   model: llama3.2
+#   api_base: http://localhost:11434
+#
+# LM Studio (lokální):
+# llm:
+#   provider: lmstudio
+#   model: local-model
+#   api_base: http://localhost:1234/v1
+#
+# Google Gemini:
+# llm:
+#   provider: gemini
+#   model: gemini-2.5-flash
+
+# Scoring práhy
+scoring:
+  min_acceptable_score: 6
+  excellent_score: 8
+
+# Databáze
+database:
+  path: data/candidates.db
