@@ -227,3 +227,34 @@ known_brands:
   - slack
   - asana
   - monday
+
+# =============================================================================
+# TRADEMARK CLEARANCE
+# =============================================================================
+
+# Konfigurace pro kontrolu ochranných známek přes EUIPO API
+# Pro získání přístupových údajů:
+#   1. Vytvořte účet na https://dev.euipo.europa.eu
+#   2. Zaregistrujte aplikaci v sekci Apps
+#   3. Zkopírujte client_id a client_secret
+#
+# API dokumentace: https://dev.euipo.europa.eu/product/trademark-search_100
+trademark:
+  euipo:
+    # client_id: ${EUIPO_CLIENT_ID}   # Nastavte v .env nebo zde
+    # client_secret: ${EUIPO_CLIENT_SECRET}
+    sandbox: true                     # true pro testovací prostředí, false pro produkci
+    timeout_seconds: 30
+  # Výchozí třídy Nice pro vyhledávání
+  # (software, IT služby, business služby)
+  default_nice_classes: [9, 35, 42]
+  # Práh podobnosti pro detekci konfliktů (0.0-1.0)
+  similarity_threshold: 0.7
+
+# Příklady tříd Nice:
+#   9  - Software, počítače, elektronické publikace
+#   16 - Papír, tištěné materiály, kancelářské potřeby
+#   35 - Reklama, obchodní management, administrativa
+#   38 - Telekomunikace
+#   42 - IT služby, vývoj software, SaaS
+#   45 - Právní služby, licencování

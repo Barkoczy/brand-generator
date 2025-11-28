@@ -44,6 +44,31 @@ class DatabaseConfig:
 
 
 @dataclass
+class EuipoConfig:
+    """EUIPO API configuration.
+
+    To obtain credentials:
+    1. Create an account at https://dev.euipo.europa.eu
+    2. Register your application in the Apps section
+    3. Get client_id and client_secret
+    """
+
+    client_id: str | None = None
+    client_secret: str | None = None
+    sandbox: bool = True
+    timeout_seconds: int = 30
+
+
+@dataclass
+class TrademarkConfig:
+    """Trademark clearance configuration."""
+
+    euipo: EuipoConfig = field(default_factory=EuipoConfig)
+    default_nice_classes: list[int] = field(default_factory=lambda: [9, 35, 42])
+    similarity_threshold: float = 0.7
+
+
+@dataclass
 class Settings:
     """Main settings container for brand generator."""
 
@@ -59,6 +84,7 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    trademark: TrademarkConfig = field(default_factory=TrademarkConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Settings":
@@ -66,11 +92,30 @@ class Settings:
         llm_data = data.pop("llm", {})
         scoring_data = data.pop("scoring", {})
         database_data = data.pop("database", {})
+        trademark_data = data.pop("trademark", {})
+
+        # Remove keys that are not part of Settings dataclass
+        # These are used by other modules (genetic optimizer, phonetic models)
+        data.pop("genetic", None)
+        data.pop("islands", None)
+        data.pop("phonetic_weights", None)
+        data.pop("known_brands", None)
+
+        # Parse nested trademark config
+        trademark_config = TrademarkConfig()
+        if trademark_data:
+            euipo_data = trademark_data.pop("euipo", {})
+            trademark_config = TrademarkConfig(
+                euipo=EuipoConfig(**euipo_data) if euipo_data else EuipoConfig(),
+                default_nice_classes=trademark_data.get("default_nice_classes", [9, 35, 42]),
+                similarity_threshold=trademark_data.get("similarity_threshold", 0.7),
+            )
 
         return cls(
             llm=LLMConfig(**llm_data) if llm_data else LLMConfig(),
             scoring=ScoringConfig(**scoring_data) if scoring_data else ScoringConfig(),
             database=DatabaseConfig(**database_data) if database_data else DatabaseConfig(),
+            trademark=trademark_config,
             **data,
         )
 

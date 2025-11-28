@@ -29,6 +29,10 @@ class StoredCandidate:
     status: str  # new, favorite, rejected
     created_at: datetime
     updated_at: datetime
+    # Trademark clearance fields
+    trademark_risk: str | None = None  # HIGH, MEDIUM, LOW
+    trademark_checked_at: datetime | None = None
+    trademark_conflicts: list[dict] | None = None
 
     @property
     def best_score(self) -> float:
@@ -38,6 +42,16 @@ class StoredCandidate:
         if self.heuristic_score is not None:
             return self.heuristic_score
         return 0.0
+
+    @property
+    def is_trademark_safe(self) -> bool:
+        """Check if trademark clearance passed (LOW risk)."""
+        return self.trademark_risk == "LOW"
+
+    @property
+    def trademark_conflict_count(self) -> int:
+        """Number of trademark conflicts found."""
+        return len(self.trademark_conflicts) if self.trademark_conflicts else 0
 
 
 class CandidateRepository:
@@ -80,7 +94,10 @@ class CandidateRepository:
                     recommendation TEXT,
                     status TEXT DEFAULT 'new',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    trademark_risk TEXT,
+                    trademark_checked_at TIMESTAMP,
+                    trademark_conflicts TEXT
                 )
             """)
 
@@ -96,10 +113,54 @@ class CandidateRepository:
                 CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status)
             """)
 
+            # Add columns to existing tables (migration)
+            self._migrate_trademark_columns(conn)
+
+            # Create trademark index after migration ensures column exists
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_candidates_trademark_risk
+                ON candidates(trademark_risk)
+            """)
+
             conn.commit()
+
+    def _migrate_trademark_columns(self, conn: sqlite3.Connection) -> None:
+        """Add trademark columns if they don't exist (migration for existing DBs)."""
+        cursor = conn.execute("PRAGMA table_info(candidates)")
+        columns = {row["name"] for row in cursor.fetchall()}
+
+        if "trademark_risk" not in columns:
+            conn.execute("ALTER TABLE candidates ADD COLUMN trademark_risk TEXT")
+        if "trademark_checked_at" not in columns:
+            conn.execute("ALTER TABLE candidates ADD COLUMN trademark_checked_at TIMESTAMP")
+        if "trademark_conflicts" not in columns:
+            conn.execute("ALTER TABLE candidates ADD COLUMN trademark_conflicts TEXT")
 
     def _row_to_stored_candidate(self, row: sqlite3.Row) -> StoredCandidate:
         """Convert database row to StoredCandidate."""
+        # Handle trademark_checked_at (may not exist in old DBs)
+        trademark_checked_at = None
+        try:
+            if row["trademark_checked_at"]:
+                trademark_checked_at = datetime.fromisoformat(row["trademark_checked_at"])
+        except (KeyError, IndexError):
+            pass
+
+        # Handle trademark_conflicts JSON
+        trademark_conflicts = None
+        try:
+            if row["trademark_conflicts"]:
+                trademark_conflicts = json.loads(row["trademark_conflicts"])
+        except (KeyError, IndexError):
+            pass
+
+        # Handle trademark_risk
+        trademark_risk = None
+        try:
+            trademark_risk = row["trademark_risk"]
+        except (KeyError, IndexError):
+            pass
+
         return StoredCandidate(
             id=row["id"],
             name=row["name"],
@@ -114,6 +175,9 @@ class CandidateRepository:
             status=row["status"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+            trademark_risk=trademark_risk,
+            trademark_checked_at=trademark_checked_at,
+            trademark_conflicts=trademark_conflicts,
         )
 
     def save_candidate(
@@ -378,3 +442,103 @@ class CandidateRepository:
         with self._get_connection() as conn:
             cursor = conn.execute(query, params)
             return [self._row_to_stored_candidate(row) for row in cursor.fetchall()]
+
+    def save_trademark_result(
+        self,
+        name: str,
+        risk_level: str,
+        conflicts: list[dict] | None = None,
+    ) -> None:
+        """Save trademark clearance result for a candidate.
+
+        Args:
+            name: Name of the candidate
+            risk_level: Risk level (HIGH, MEDIUM, LOW)
+            conflicts: Optional list of conflict dictionaries
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE candidates
+                SET trademark_risk = ?,
+                    trademark_checked_at = CURRENT_TIMESTAMP,
+                    trademark_conflicts = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE name = ?
+                """,
+                (risk_level, json.dumps(conflicts) if conflicts else None, name),
+            )
+            conn.commit()
+
+    def get_unchecked_trademarks(self, limit: int = 100) -> list[StoredCandidate]:
+        """Get candidates without trademark clearance check.
+
+        Args:
+            limit: Maximum number of results
+
+        Returns:
+            List of candidates without trademark check
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM candidates
+                WHERE trademark_risk IS NULL
+                ORDER BY
+                    CASE WHEN llm_score IS NOT NULL THEN llm_score ELSE 0 END DESC,
+                    CASE WHEN heuristic_score IS NOT NULL THEN heuristic_score ELSE 0 END DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [self._row_to_stored_candidate(row) for row in cursor.fetchall()]
+
+    def get_trademark_safe(self, limit: int = 50) -> list[StoredCandidate]:
+        """Get candidates with LOW trademark risk.
+
+        Args:
+            limit: Maximum number of results
+
+        Returns:
+            List of candidates with LOW trademark risk
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM candidates
+                WHERE trademark_risk = 'LOW'
+                ORDER BY
+                    CASE WHEN llm_score IS NOT NULL THEN llm_score ELSE 0 END DESC,
+                    CASE WHEN heuristic_score IS NOT NULL THEN heuristic_score ELSE 0 END DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [self._row_to_stored_candidate(row) for row in cursor.fetchall()]
+
+    def count_by_trademark_risk(self) -> dict[str, int]:
+        """Count candidates by trademark risk level.
+
+        Returns:
+            Dictionary with counts: {"HIGH": n, "MEDIUM": n, "LOW": n, "unchecked": n}
+        """
+        with self._get_connection() as conn:
+            result = {
+                "HIGH": 0,
+                "MEDIUM": 0,
+                "LOW": 0,
+                "unchecked": 0,
+            }
+
+            cursor = conn.execute(
+                "SELECT trademark_risk, COUNT(*) FROM candidates GROUP BY trademark_risk"
+            )
+            for row in cursor.fetchall():
+                risk = row[0]
+                count = row[1]
+                if risk is None:
+                    result["unchecked"] = count
+                elif risk in result:
+                    result[risk] = count
+
+            return result

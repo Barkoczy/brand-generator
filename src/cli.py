@@ -16,6 +16,7 @@ from src.generator import GeneticConfig, GeneticOptimizer, IslandConfig, IslandO
 from src.generator.genetic_optimizer import GenerationStats as GeneticStats
 from src.llm import check_provider_availability, get_default_model, list_providers
 from src.scoring import CombinedPhoneticScorer
+from src.trademark.clearance_checker import create_checker_from_settings
 
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / ".env"
@@ -665,6 +666,309 @@ def compare_names(ctx: click.Context, nazvy: tuple[str, ...]) -> None:
     # Winner announcement
     winner_name, winner_result = results[0]
     console.print(f"\n[bold green]🏆 Nejlepší kandidát: {winner_name} ({winner_result.total_score:.1f}/10)[/bold green]")
+
+
+# =============================================================================
+# TRADEMARK CLEARANCE COMMANDS
+# =============================================================================
+
+
+@cli.command("clearance")
+@click.argument("nazev")
+@click.option(
+    "--tridy",
+    "-t",
+    type=str,
+    default="",
+    help="Seznam tříd Nice oddělených čárkou (např. 9,35,42)",
+)
+@click.pass_context
+def check_trademark(ctx: click.Context, nazev: str, tridy: str) -> None:
+    """Zkontroluj kolize názvu v databázi ochranných známek.
+
+    Prohledá databázi EUIPO a vrátí rizikové hodnocení.
+    Bez API klíčů použije simulovaná data (mock).
+
+    Příklady:
+        brand-gen clearance MYNAME
+        brand-gen clearance MYNAME --tridy 9,35,42
+    """
+    settings = ctx.obj["settings"]
+
+    # Parse Nice classes
+    if tridy:
+        nice_classes = [int(c.strip()) for c in tridy.split(",") if c.strip()]
+    else:
+        nice_classes = settings.trademark.default_nice_classes
+
+    console.print(f"\n[bold]Kontroluji název: {nazev}[/bold]")
+    console.print(f"[dim]Třídy Nice: {', '.join(map(str, nice_classes))}[/dim]")
+
+    # Create checker - use env vars as fallback if not in config
+    import os
+    client_id = settings.trademark.euipo.client_id or os.getenv("EUIPO_CLIENT_ID")
+    client_secret = settings.trademark.euipo.client_secret or os.getenv("EUIPO_CLIENT_SECRET")
+
+    checker = create_checker_from_settings(
+        client_id=client_id,
+        client_secret=client_secret,
+        sandbox=settings.trademark.euipo.sandbox,
+        similarity_threshold=settings.trademark.similarity_threshold,
+    )
+
+    if checker.is_using_mock:
+        console.print("[yellow]⚠ Používám simulovaná data (EUIPO API není nakonfigurováno)[/yellow]")
+
+    # Check name
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        progress.add_task("Prohledávám databázi...", total=None)
+        result = checker.check_name(nazev, nice_classes)
+
+    # Display results
+    console.print()
+    risk_colors = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}
+    risk_emojis = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢"}
+
+    console.print(Panel(
+        f"[bold]Riziko: [{risk_colors[result.risk_level]}]{risk_emojis[result.risk_level]} "
+        f"{result.risk_level}[/{risk_colors[result.risk_level]}][/bold]",
+        title=f"Trademark Clearance – {nazev}",
+    ))
+
+    if result.overlapping_classes:
+        console.print(f"[bold]Překrývající se třídy:[/bold] {', '.join(map(str, result.overlapping_classes))}")
+
+    console.print(f"\n[bold]Doporučení:[/bold] {result.recommendation}")
+
+    if result.conflicts:
+        console.print(f"\n[bold]Nalezené konflikty ({len(result.conflicts)}):[/bold]")
+
+        table = Table()
+        table.add_column("Známka", style="cyan")
+        table.add_column("Číslo")
+        table.add_column("Status")
+        table.add_column("Třídy")
+        table.add_column("Podobnost", justify="right")
+
+        for c in result.conflicts[:15]:
+            sim_color = "red" if c.similarity_score > 0.8 else ("yellow" if c.similarity_score > 0.6 else "dim")
+            table.add_row(
+                c.name,
+                c.application_number,
+                c.status,
+                ", ".join(map(str, c.nice_classes[:5])),
+                f"[{sim_color}]{c.similarity_percent}%[/{sim_color}]",
+            )
+
+        console.print(table)
+
+        if len(result.conflicts) > 15:
+            console.print(f"[dim]... a dalších {len(result.conflicts) - 15} konfliktů[/dim]")
+    else:
+        console.print("\n[green]Žádné konfliktní známky nenalezeny.[/green]")
+
+    # Save to database if candidate exists
+    repo = CandidateRepository(settings)
+    if repo.exists(nazev):
+        conflicts_data = [
+            {
+                "name": c.name,
+                "application_number": c.application_number,
+                "status": c.status,
+                "nice_classes": c.nice_classes,
+                "similarity_score": c.similarity_score,
+            }
+            for c in result.conflicts
+        ]
+        repo.save_trademark_result(nazev, result.risk_level, conflicts_data)
+        console.print(f"\n[dim]Výsledek uložen do databáze.[/dim]")
+
+
+@cli.command("clearance-batch")
+@click.argument("soubor", type=click.Path(exists=True))
+@click.option(
+    "--tridy",
+    "-t",
+    type=str,
+    default="",
+    help="Seznam tříd Nice oddělených čárkou (např. 9,35,42)",
+)
+@click.option(
+    "--vystup",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Soubor pro export výsledků (CSV)",
+)
+@click.pass_context
+def check_trademark_batch(
+    ctx: click.Context,
+    soubor: str,
+    tridy: str,
+    vystup: str | None,
+) -> None:
+    """Hromadně zkontroluj názvy ze souboru.
+
+    Načte názvy ze souboru (jeden na řádek) a zkontroluje
+    každý proti databázi ochranných známek.
+
+    Příklady:
+        brand-gen clearance-batch nazvy.txt
+        brand-gen clearance-batch nazvy.txt --tridy 9,35,42 --vystup report.csv
+    """
+    settings = ctx.obj["settings"]
+
+    # Parse Nice classes
+    if tridy:
+        nice_classes = [int(c.strip()) for c in tridy.split(",") if c.strip()]
+    else:
+        nice_classes = settings.trademark.default_nice_classes
+
+    # Load names from file
+    with open(soubor, encoding="utf-8") as f:
+        names = [line.strip() for line in f if line.strip()]
+
+    if not names:
+        console.print("[red]Soubor neobsahuje žádné názvy.[/red]")
+        return
+
+    console.print(f"\n[bold]Hromadná kontrola ochranných známek[/bold]")
+    console.print(f"[dim]Počet názvů: {len(names)}[/dim]")
+    console.print(f"[dim]Třídy Nice: {', '.join(map(str, nice_classes))}[/dim]")
+
+    # Create checker - use env vars as fallback if not in config
+    import os
+    client_id = settings.trademark.euipo.client_id or os.getenv("EUIPO_CLIENT_ID")
+    client_secret = settings.trademark.euipo.client_secret or os.getenv("EUIPO_CLIENT_SECRET")
+
+    checker = create_checker_from_settings(
+        client_id=client_id,
+        client_secret=client_secret,
+        sandbox=settings.trademark.euipo.sandbox,
+        similarity_threshold=settings.trademark.similarity_threshold,
+    )
+
+    if checker.is_using_mock:
+        console.print("[yellow]⚠ Používám simulovaná data (EUIPO API není nakonfigurováno)[/yellow]")
+
+    # Check all names
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Kontroluji názvy...", total=len(names))
+
+        for name in names:
+            result = checker.check_name(name, nice_classes)
+            results.append(result)
+            progress.update(task, advance=1, description=f"Kontroluji: {name}")
+
+    # Count results
+    high_count = sum(1 for r in results if r.risk_level == "HIGH")
+    medium_count = sum(1 for r in results if r.risk_level == "MEDIUM")
+    low_count = sum(1 for r in results if r.risk_level == "LOW")
+
+    # Summary
+    console.print(f"\n[bold]Souhrn:[/bold]")
+    console.print(f"  🔴 Vysoké riziko: [red]{high_count}[/red]")
+    console.print(f"  🟠 Střední riziko: [yellow]{medium_count}[/yellow]")
+    console.print(f"  🟢 Nízké riziko: [green]{low_count}[/green]")
+
+    # Display table
+    table = Table(title="Výsledky kontroly")
+    table.add_column("Název", style="cyan")
+    table.add_column("Riziko", justify="center")
+    table.add_column("Konflikty", justify="right")
+    table.add_column("Max. podobnost", justify="right")
+
+    for r in sorted(results, key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x.risk_level]):
+        risk_colors = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}
+        risk_emojis = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢"}
+        table.add_row(
+            r.candidate_name,
+            f"[{risk_colors[r.risk_level]}]{risk_emojis[r.risk_level]} {r.risk_level}[/{risk_colors[r.risk_level]}]",
+            str(r.conflict_count),
+            f"{r.max_similarity * 100:.0f}%" if r.conflicts else "-",
+        )
+
+    console.print(table)
+
+    # Export to CSV
+    if vystup:
+        with open(vystup, "w", encoding="utf-8") as f:
+            f.write("name,risk_level,conflict_count,max_similarity,overlapping_classes\n")
+            for r in results:
+                f.write(
+                    f"{r.candidate_name},{r.risk_level},{r.conflict_count},"
+                    f"{r.max_similarity:.2f},\"{','.join(map(str, r.overlapping_classes))}\"\n"
+                )
+        console.print(f"\n[green]Export uložen do: {vystup}[/green]")
+
+    # Safe candidates
+    safe = [r.candidate_name for r in results if r.risk_level == "LOW"]
+    if safe:
+        console.print(f"\n[bold green]Bezpečné názvy ({len(safe)}):[/bold green]")
+        for name in safe[:10]:
+            console.print(f"  ✓ {name}")
+        if len(safe) > 10:
+            console.print(f"  [dim]... a dalších {len(safe) - 10}[/dim]")
+
+
+@cli.command("trademark-stats")
+@click.pass_context
+def show_trademark_stats(ctx: click.Context) -> None:
+    """Zobraz statistiky kontroly ochranných známek."""
+    settings = ctx.obj["settings"]
+    repo = CandidateRepository(settings)
+
+    stats = repo.count_by_trademark_risk()
+
+    console.print("\n[bold]Statistiky kontroly ochranných známek[/bold]")
+    console.print(f"  🔴 Vysoké riziko: [red]{stats['HIGH']}[/red]")
+    console.print(f"  🟠 Střední riziko: [yellow]{stats['MEDIUM']}[/yellow]")
+    console.print(f"  🟢 Nízké riziko: [green]{stats['LOW']}[/green]")
+    console.print(f"  ⏳ Nezkontrolováno: [dim]{stats['unchecked']}[/dim]")
+
+    total_checked = stats["HIGH"] + stats["MEDIUM"] + stats["LOW"]
+    if total_checked > 0:
+        safe_pct = stats["LOW"] / total_checked * 100
+        console.print(f"\n[dim]Bezpečných kandidátů: {safe_pct:.1f}%[/dim]")
+
+
+@cli.command("trademark-safe")
+@click.option("--limit", "-l", default=20, help="Počet zobrazených kandidátů")
+@click.pass_context
+def show_trademark_safe(ctx: click.Context, limit: int) -> None:
+    """Zobraz kandidáty s nízkým rizikem kolize ochranných známek."""
+    settings = ctx.obj["settings"]
+    repo = CandidateRepository(settings)
+
+    candidates = repo.get_trademark_safe(limit=limit)
+
+    if not candidates:
+        console.print("[yellow]Žádní kandidáti s nízkým rizikem zatím nejsou.[/yellow]")
+        console.print("[dim]Tip: Použij 'brand-gen clearance NAZEV' pro kontrolu.[/dim]")
+        return
+
+    table = Table(title=f"Kandidáti s nízkým rizikem kolize ({len(candidates)})")
+    table.add_column("Název", style="bold cyan")
+    table.add_column("LLM Skóre", justify="right")
+    table.add_column("Heur. Skóre", justify="right")
+    table.add_column("Zkontrolováno")
+
+    for c in candidates:
+        llm_str = str(c.llm_score) if c.llm_score else "-"
+        heur_str = f"{c.heuristic_score:.1f}" if c.heuristic_score else "-"
+        checked_str = c.trademark_checked_at.strftime("%Y-%m-%d") if c.trademark_checked_at else "-"
+        table.add_row(c.name, f"[green]{llm_str}[/green]", heur_str, checked_str)
+
+    console.print(table)
 
 
 @cli.command("modely")
