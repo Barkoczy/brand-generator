@@ -67,8 +67,9 @@ class EuipoClient:
 
     # API endpoints from official EUIPO documentation
     # https://dev.euipo.europa.eu/security
+    # https://dev.euipo.europa.eu/product/trademark-search_100/api/trademark-search
     SANDBOX_AUTH_URL = "https://auth-sandbox.euipo.europa.eu"
-    PROD_AUTH_URL = "https://auth.euipo.europa.eu"
+    PROD_AUTH_URL = "https://euipo.europa.eu/cas-server-webapp"
 
     SANDBOX_API_URL = "https://api-sandbox.euipo.europa.eu"
     PROD_API_URL = "https://api.euipo.europa.eu"
@@ -76,7 +77,7 @@ class EuipoClient:
     # Token endpoint (OpenID Connect)
     TOKEN_PATH = "/oidc/accessToken"
 
-    # Trademark search endpoint
+    # Trademark search endpoint (base path for API)
     SEARCH_PATH = "/trademark-search/trademarks"
 
     def __init__(
@@ -179,6 +180,45 @@ class EuipoClient:
             "Content-Type": "application/json",
         }
 
+    def _build_rsql_query(
+        self,
+        name: str,
+        nice_classes: list[int] | None = None,
+        status_filter: list[str] | None = None,
+    ) -> str:
+        """Build RSQL query string for trademark search.
+
+        EUIPO API uses RSQL (RESTful Service Query Language) for filtering.
+        See: https://dev.euipo.europa.eu/product/trademark-search_100/api/trademark-search
+
+        Args:
+            name: Trademark name to search for (supports * wildcard)
+            nice_classes: Filter by Nice classification classes
+            status_filter: Filter by status codes
+
+        Returns:
+            RSQL query string
+        """
+        conditions = []
+
+        # Search by verbal element (word mark) with wildcard
+        # Use * as wildcard for partial matching
+        escaped_name = name.replace("'", "\\'")
+        conditions.append(f"wordMarkSpecification.verbalElement==*{escaped_name}*")
+
+        # Filter by Nice classes using =in= operator
+        if nice_classes:
+            classes_str = ",".join(str(c) for c in nice_classes)
+            conditions.append(f"niceClasses=in=({classes_str})")
+
+        # Filter by status using =in= operator
+        if status_filter:
+            statuses_str = ",".join(status_filter)
+            conditions.append(f"status=in=({statuses_str})")
+
+        # Join conditions with AND (semicolon in RSQL)
+        return ";".join(conditions)
+
     def search_trademarks(
         self,
         name: str,
@@ -188,11 +228,14 @@ class EuipoClient:
     ) -> list[dict[str, Any]]:
         """Search for trademarks matching the given criteria.
 
+        Uses RSQL query syntax as per EUIPO API specification.
+        See: https://dev.euipo.europa.eu/product/trademark-search_100/api/trademark-search
+
         Args:
             name: Trademark name to search for
             nice_classes: Filter by Nice classification classes
-            status_filter: Filter by status (e.g., ["REGISTERED", "APPLIED"])
-            max_results: Maximum number of results to return
+            status_filter: Filter by status (e.g., ["REGISTERED", "APPLICATION_PUBLISHED"])
+            max_results: Maximum number of results to return (10-100)
 
         Returns:
             List of trademark data dictionaries
@@ -205,19 +248,15 @@ class EuipoClient:
 
         url = f"{self.api_url}{self.SEARCH_PATH}"
 
-        # Build query parameters
-        # Note: Parameter names should be verified against actual API spec
+        # Build RSQL query
+        rsql_query = self._build_rsql_query(name, nice_classes, status_filter)
+
+        # API parameters per documentation
         params: dict[str, Any] = {
             "page": 0,
-            "size": min(max_results, 100),  # API typically limits page size
-            "query": name,
+            "size": max(10, min(max_results, 100)),  # API requires 10-100
+            "query": rsql_query,
         }
-
-        if nice_classes:
-            params["niceClasses"] = ",".join(str(c) for c in nice_classes)
-
-        if status_filter:
-            params["status"] = ",".join(status_filter)
 
         try:
             response = self._session.get(
@@ -230,25 +269,22 @@ class EuipoClient:
 
         except requests.exceptions.RequestException as e:
             status = None
+            resp_text = None
             if hasattr(e, "response") and e.response is not None:
                 status = getattr(e.response, "status_code", None)
+                try:
+                    resp_text = e.response.text[:500]
+                except Exception:
+                    pass
             raise EuipoApiError(
-                f"Trademark search failed: {e}",
+                f"Trademark search failed: {e}" + (f" Response: {resp_text}" if resp_text else ""),
                 status_code=status,
             ) from e
 
         data = response.json()
 
-        # Extract results (structure depends on actual API response)
-        # Common patterns: data["content"], data["results"], data["trademarks"]
-        results = (
-            data.get("content")
-            or data.get("results")
-            or data.get("trademarks")
-            or (data if isinstance(data, list) else [])
-        )
-
-        return results
+        # API returns { trademarks: [...], size, totalElements, totalPages, page }
+        return data.get("trademarks", [])
 
     def get_trademark_detail(self, application_number: str) -> dict[str, Any] | None:
         """Get detailed information about a specific trademark.
@@ -292,7 +328,8 @@ class EuipoClient:
     def parse_trademark_result(self, data: dict[str, Any]) -> TrademarkConflict:
         """Parse API response data into TrademarkConflict object.
 
-        The field mapping should be adjusted based on actual API response structure.
+        Based on actual EUIPO API response structure from:
+        https://dev.euipo.europa.eu/product/trademark-search_100/api/trademark-search
 
         Args:
             data: Raw API response dictionary
@@ -300,58 +337,56 @@ class EuipoClient:
         Returns:
             TrademarkConflict object
         """
-        # These field names are illustrative - adjust based on actual API
-        name = data.get("markName") or data.get("name") or data.get("wordMark") or ""
-        app_no = data.get("applicationNumber") or data.get("id") or ""
-        status = data.get("status") or data.get("markStatus") or "UNKNOWN"
+        # Extract verbal element from wordMarkSpecification
+        word_spec = data.get("wordMarkSpecification", {})
+        name = word_spec.get("verbalElement", "") if isinstance(word_spec, dict) else ""
 
-        # Handle owner (might be nested object or string)
-        owner_data = data.get("owner") or data.get("applicant")
-        if isinstance(owner_data, dict):
-            owner = owner_data.get("name") or owner_data.get("organizationName")
-        else:
-            owner = owner_data
+        # Application number is the primary identifier
+        app_no = data.get("applicationNumber", "")
 
-        # Nice classes (might be list of ints, strings, or objects)
-        raw_classes = (
-            data.get("niceClasses")
-            or data.get("niceClassNumbers")
-            or data.get("classes")
-            or []
-        )
+        # Status field
+        status = data.get("status", "UNKNOWN")
+
+        # Extract owner from applicants list
+        owner = None
+        applicants = data.get("applicants", [])
+        if applicants and isinstance(applicants, list):
+            first_applicant = applicants[0]
+            if isinstance(first_applicant, dict):
+                # Applicant info may have name or identifier
+                owner = first_applicant.get("name") or first_applicant.get("identifier")
+
+        # Nice classes - API returns list of integers directly
         nice_classes: list[int] = []
+        raw_classes = data.get("niceClasses", [])
         for c in raw_classes:
             if isinstance(c, int):
                 nice_classes.append(c)
             elif isinstance(c, str) and c.isdigit():
                 nice_classes.append(int(c))
-            elif isinstance(c, dict):
-                class_num = c.get("classNumber") or c.get("number")
-                if class_num:
-                    nice_classes.append(int(class_num))
 
-        # Dates (might be ISO string or timestamp)
+        # Dates - ISO format strings (YYYY-MM-DD)
         filing_date = None
         reg_date = None
 
-        filing_str = data.get("filingDate") or data.get("applicationDate")
+        filing_str = data.get("applicationDate")
         if filing_str:
             try:
-                filing_date = datetime.fromisoformat(filing_str.replace("Z", "+00:00"))
+                filing_date = datetime.fromisoformat(filing_str)
             except (ValueError, AttributeError):
                 pass
 
         reg_str = data.get("registrationDate")
         if reg_str:
             try:
-                reg_date = datetime.fromisoformat(reg_str.replace("Z", "+00:00"))
+                reg_date = datetime.fromisoformat(reg_str)
             except (ValueError, AttributeError):
                 pass
 
         return TrademarkConflict(
             name=name,
             application_number=str(app_no),
-            status=status.upper(),
+            status=status.upper() if status else "UNKNOWN",
             nice_classes=nice_classes,
             owner=owner,
             similarity_score=0.0,  # Will be calculated separately
