@@ -1,9 +1,23 @@
-"""Heuristic scorer for candidate names (no LLM required)."""
+"""Heuristic scorer for candidate names (no LLM required).
+
+This module provides both basic heuristic scoring and advanced phonetic
+scoring using mathematical models:
+- Markov chains for natural phoneme sequences
+- Sonority Sequencing Principle (SSP)
+- Shannon entropy for pattern balance
+- Phonotactic probability
+- Zipf's law phoneme weighting
+- Levenshtein distance for uniqueness
+"""
 
 from dataclasses import dataclass, field
 
 from src.config import Settings
 from src.generator.candidate_generator import Candidate
+from src.scoring.phonetic_models import (
+    CombinedPhoneticScorer,
+    PhoneticScoreResult,
+)
 
 
 @dataclass
@@ -15,29 +29,49 @@ class HeuristicScore:
     bonuses: list[str] = field(default_factory=list)
     penalties: list[str] = field(default_factory=list)
 
+    # Advanced phonetic scores (optional)
+    phonetic_result: PhoneticScoreResult | None = None
+
     @property
     def passed(self) -> bool:
         """Check if candidate passed minimum score threshold."""
         return self.score >= 5.0
+
+    @property
+    def combined_score(self) -> float:
+        """Get combined score (basic + phonetic if available)."""
+        if self.phonetic_result:
+            # Weight: 40% basic heuristic, 60% phonetic models
+            return self.score * 0.4 + self.phonetic_result.total_score * 0.6
+        return self.score
 
 
 class HeuristicScorer:
     """Heuristic scorer for evaluating name candidates without LLM.
 
     Applies rule-based scoring to quickly filter candidates before
-    more expensive LLM evaluation.
+    more expensive LLM evaluation. Can optionally use advanced
+    phonetic models for more sophisticated scoring.
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, use_advanced_scoring: bool = True):
         """Initialize scorer with settings.
 
         Args:
             settings: Configuration settings
+            use_advanced_scoring: Enable advanced phonetic models
         """
         self.settings = settings
         self.consonants = set(settings.consonants)
         self.vowels = set(settings.vowels)
         self.preferred_starts = set(settings.preferred_starts)
+        self.use_advanced_scoring = use_advanced_scoring
+
+        # Initialize advanced phonetic scorer
+        if use_advanced_scoring:
+            self.phonetic_scorer = CombinedPhoneticScorer()
+        else:
+            self.phonetic_scorer = None
 
     def score_cv_alternation(self, name: str) -> tuple[float, str | None]:
         """Score based on consonant-vowel alternation quality.
@@ -188,7 +222,7 @@ class HeuristicScorer:
         bonuses: list[str] = []
         penalties: list[str] = []
 
-        # Apply all scoring functions
+        # Apply all basic scoring functions
         scoring_functions = [
             self.score_cv_alternation,
             self.score_preferred_start,
@@ -211,11 +245,33 @@ class HeuristicScorer:
         # Clamp to 0-10 range
         final_score = max(0.0, min(10.0, base_score))
 
+        # Apply advanced phonetic scoring if enabled
+        phonetic_result = None
+        if self.use_advanced_scoring and self.phonetic_scorer:
+            phonetic_result = self.phonetic_scorer.score(name)
+
+            # Add phonetic insights to bonuses/penalties
+            if phonetic_result.markov_score >= 7:
+                bonuses.append(f"Přirozené fonémy (Markov: {phonetic_result.markov_score:.1f})")
+            elif phonetic_result.markov_score < 4:
+                penalties.append(f"Nepřirozené fonémy (Markov: {phonetic_result.markov_score:.1f})")
+
+            if phonetic_result.sonority_score >= 7:
+                bonuses.append(f"Snadná výslovnost (SSP: {phonetic_result.sonority_score:.1f})")
+            elif phonetic_result.sonority_score < 4:
+                penalties.append(f"Obtížná výslovnost (SSP: {phonetic_result.sonority_score:.1f})")
+
+            if phonetic_result.uniqueness_score >= 8:
+                bonuses.append(f"Vysoká unikátnost ({phonetic_result.uniqueness_score:.1f})")
+            elif phonetic_result.uniqueness_score < 5:
+                penalties.append(f"Podobné existujícím slovům ({phonetic_result.uniqueness_score:.1f})")
+
         return HeuristicScore(
             candidate=candidate,
             score=final_score,
             bonuses=bonuses,
             penalties=penalties,
+            phonetic_result=phonetic_result,
         )
 
     def score_batch(self, candidates: list[Candidate]) -> list[HeuristicScore]:
@@ -225,10 +281,11 @@ class HeuristicScorer:
             candidates: List of candidates to score
 
         Returns:
-            List of HeuristicScore objects, sorted by score descending
+            List of HeuristicScore objects, sorted by combined score descending
         """
         scores = [self.score(c) for c in candidates]
-        return sorted(scores, key=lambda s: s.score, reverse=True)
+        # Sort by combined score (includes phonetic models if enabled)
+        return sorted(scores, key=lambda s: s.combined_score, reverse=True)
 
     def filter_by_score(
         self, candidates: list[Candidate], min_score: float = 5.0
@@ -240,7 +297,7 @@ class HeuristicScorer:
             min_score: Minimum score threshold
 
         Returns:
-            List of HeuristicScore objects above threshold, sorted by score
+            List of HeuristicScore objects above threshold, sorted by combined score
         """
         scores = self.score_batch(candidates)
-        return [s for s in scores if s.score >= min_score]
+        return [s for s in scores if s.combined_score >= min_score]

@@ -176,3 +176,54 @@ scoring:
 # Databáze
 database:
   path: data/candidates.db
+
+# =============================================================================
+# ADVANCED MATHEMATICAL MODELS
+# =============================================================================
+
+# Genetický algoritmus
+genetic:
+  population_size: 200    # Velikost populace
+  generations: 50         # Počet generací
+  mutation_rate: 0.15     # Míra mutace (0-1)
+  crossover_rate: 0.7     # Míra křížení (0-1)
+  tournament_size: 5      # Velikost turnaje pro selekci
+  elite_count: 10         # Počet elitních jedinců (nezměněných)
+  target_score: 8.0       # Cílové skóre pro předčasné ukončení
+  max_stagnation: 10      # Max generací bez zlepšení
+
+# Ostrovní model (paralelní evoluce)
+islands:
+  num_islands: 4          # Počet ostrovů
+  migration_rate: 0.1     # Míra migrace (0-1)
+  migration_interval: 10  # Interval migrace (generace)
+
+# Váhy fonetických modelů (musí dávat součet 1.0)
+# Upravte podle preferencí:
+#   - markov: Přirozenost sekvencí písmen
+#   - sonority: Snadnost výslovnosti (SSP)
+#   - entropy: Vyváženost vzorů
+#   - phonotactic: Dodržení fonetických pravidel
+#   - zipf: Použití běžných fonémů
+#   - uniqueness: Unikátnost názvu
+phonetic_weights:
+  markov: 0.20
+  sonority: 0.20
+  entropy: 0.10
+  phonotactic: 0.20
+  zipf: 0.10
+  uniqueness: 0.20
+
+# Známé značky pro kontrolu unikátnosti
+# Přidejte konkurenční značky ve vašem oboru
+known_brands:
+  - google
+  - apple
+  - amazon
+  - microsoft
+  - adobe
+  - dropbox
+  - notion
+  - slack
+  - asana
+  - monday

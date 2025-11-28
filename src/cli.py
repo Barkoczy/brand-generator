@@ -5,12 +5,17 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from src.agent.orchestrator import GenerationStats, NameGenAgent
 from src.config import load_settings
 from src.db.repository import CandidateRepository
+from src.generator import GeneticConfig, GeneticOptimizer, IslandConfig, IslandOptimizer
+from src.generator.genetic_optimizer import GenerationStats as GeneticStats
 from src.llm import check_provider_availability, get_default_model, list_providers
+from src.scoring import CombinedPhoneticScorer
 
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / ".env"
@@ -398,6 +403,321 @@ def export_candidates(ctx: click.Context, soubor: str, min_skore: int, format: s
             json_module.dump(data, f, ensure_ascii=False, indent=2)
 
     console.print(f"[green]Exportováno {len(candidates)} kandidátů do {soubor}[/green]")
+
+
+# =============================================================================
+# ADVANCED COMMANDS - Genetic Algorithm & Phonetic Analysis
+# =============================================================================
+
+
+@cli.command("evoluce")
+@click.option("--populace", "-p", default=200, help="Velikost populace")
+@click.option("--generace", "-g", default=50, help="Počet generací")
+@click.option("--mutace", "-m", default=0.15, type=float, help="Míra mutace (0-1)")
+@click.option("--cil", "-t", default=8.0, type=float, help="Cílové skóre")
+@click.option("--ostrovy", "-o", default=1, help="Počet ostrovů (paralelní evoluce)")
+@click.option("--vystup", type=click.Path(), default=None, help="Soubor pro export")
+@click.pass_context
+def run_evolution(
+    ctx: click.Context,
+    populace: int,
+    generace: int,
+    mutace: float,
+    cil: float,
+    ostrovy: int,
+    vystup: str | None,
+) -> None:
+    """Spusť genetický algoritmus pro optimalizaci názvů.
+
+    Evoluční přístup využívající:
+    - Selekci nejlepších kandidátů (turnajová)
+    - Křížení (crossover) úspěšných názvů
+    - Mutaci pro diverzitu
+    - Elitismus (zachování nejlepších)
+
+    Příklady:
+        brand-gen evoluce --populace 500 --generace 100
+        brand-gen evoluce --ostrovy 4 --cil 9.0
+    """
+    settings = ctx.obj["settings"]
+
+    console.print("[bold]🧬 Spouštím genetický algoritmus...[/bold]")
+    console.print(f"[dim]Populace: {populace}, Generace: {generace}[/dim]")
+    console.print(f"[dim]Mutace: {mutace:.0%}, Cílové skóre: {cil}[/dim]")
+
+    if ostrovy > 1:
+        console.print(f"[dim]Ostrovní model: {ostrovy} ostrovů[/dim]")
+
+    genetic_config = GeneticConfig(
+        population_size=populace,
+        generations=generace,
+        mutation_rate=mutace,
+        target_score=cil,
+    )
+
+    def progress_callback(stats: GeneticStats) -> None:
+        """Display generation progress."""
+        console.print(
+            f"[cyan]Gen {stats.generation:3d}[/cyan] | "
+            f"Best: [green]{stats.best_fitness:.2f}[/green] | "
+            f"Avg: {stats.avg_fitness:.2f} | "
+            f"Best word: [bold]{stats.best_word}[/bold]"
+        )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Evoluce probíhá...", total=None)
+
+        if ostrovy > 1:
+            island_config = IslandConfig(num_islands=ostrovy)
+            optimizer = IslandOptimizer(settings, genetic_config, island_config)
+        else:
+            optimizer = GeneticOptimizer(
+                settings, genetic_config, progress_callback=progress_callback
+            )
+
+        candidates = optimizer.get_best_candidates(count=20)
+        progress.update(task, completed=True)
+
+    if not candidates:
+        console.print("[red]Nepodařilo se vygenerovat kandidáty.[/red]")
+        return
+
+    # Score candidates with phonetic models
+    scorer = CombinedPhoneticScorer()
+
+    table = Table(title="🏆 Top kandidáti z evoluce")
+    table.add_column("#", style="dim")
+    table.add_column("Název", style="bold cyan")
+    table.add_column("Vzor")
+    table.add_column("Celkové", justify="right")
+    table.add_column("Markov", justify="right")
+    table.add_column("Sonorita", justify="right")
+    table.add_column("Unikátnost", justify="right")
+
+    for i, c in enumerate(candidates[:20], 1):
+        result = scorer.score(c.name)
+        score_color = "green" if result.total_score >= 8 else "yellow"
+        table.add_row(
+            str(i),
+            c.name,
+            c.pattern,
+            f"[{score_color}]{result.total_score:.1f}[/{score_color}]",
+            f"{result.markov_score:.1f}",
+            f"{result.sonority_score:.1f}",
+            f"{result.uniqueness_score:.1f}",
+        )
+
+    console.print(table)
+
+    if vystup:
+        with open(vystup, "w", encoding="utf-8") as f:
+            for c in candidates:
+                f.write(f"{c.name}\n")
+        console.print(f"[green]Export uložen do: {vystup}[/green]")
+
+
+@cli.command("analyzuj")
+@click.argument("nazev")
+@click.pass_context
+def analyze_phonetics(ctx: click.Context, nazev: str) -> None:
+    """Zobraz detailní fonetickou analýzu názvu.
+
+    Analyzuje název pomocí matematických modelů:
+    - Markovovy řetězce (přirozenost sekvencí)
+    - Sonority Sequencing Principle (vyslovitelnost)
+    - Shannon entropie (vyváženost vzorů)
+    - Fonotaktická pravděpodobnost
+    - Zipfův zákon (frekvence fonémů)
+    - Levenshteinova vzdálenost (unikátnost)
+
+    Příklady:
+        brand-gen analyzuj Valujo
+        brand-gen analyzuj Nextra
+    """
+    scorer = CombinedPhoneticScorer()
+    result = scorer.score(nazev)
+
+    console.print()
+    console.print(Panel(f"[bold cyan]{nazev}[/bold cyan]", title="Fonetická analýza"))
+
+    # Overall score
+    score_color = "green" if result.total_score >= 8 else ("yellow" if result.total_score >= 6 else "red")
+    console.print(f"\n[bold]Celkové skóre:[/bold] [{score_color}]{result.total_score:.2f}/10[/{score_color}]")
+
+    # Detailed scores table
+    table = Table(title="Detailní skóre", show_header=True)
+    table.add_column("Model", style="cyan")
+    table.add_column("Skóre", justify="right")
+    table.add_column("Váha", justify="right")
+    table.add_column("Příspěvek", justify="right")
+    table.add_column("Popis")
+
+    weights = scorer.weights
+    models_info = [
+        ("Markov (n-gramy)", result.markov_score, weights["markov"], "Přirozenost sekvencí písmen"),
+        ("Sonorita (SSP)", result.sonority_score, weights["sonority"], "Soulad se slabičnou strukturou"),
+        ("Entropie", result.entropy_score, weights["entropy"], "Vyváženost vzorů (ne příliš náhodné/repetitivní)"),
+        ("Fonotaktika", result.phonotactic_score, weights["phonotactic"], "Pravděpodobnost zvukových kombinací"),
+        ("Zipfův zákon", result.zipf_score, weights["zipf"], "Použití běžných vs vzácných fonémů"),
+        ("Unikátnost", result.uniqueness_score, weights["uniqueness"], "Vzdálenost od existujících slov/značek"),
+    ]
+
+    for name, score, weight, desc in models_info:
+        contribution = score * weight
+        score_color = "green" if score >= 7 else ("yellow" if score >= 5 else "red")
+        table.add_row(
+            name,
+            f"[{score_color}]{score:.1f}[/{score_color}]",
+            f"{weight:.0%}",
+            f"{contribution:.2f}",
+            desc,
+        )
+
+    console.print(table)
+
+    # Interpretation
+    console.print("\n[bold]Interpretace:[/bold]")
+
+    if result.markov_score >= 7:
+        console.print("  [green]✓[/green] Sekvence písmen znějí přirozeně")
+    elif result.markov_score < 4:
+        console.print("  [red]✗[/red] Sekvence písmen znějí nepřirozeně")
+
+    if result.sonority_score >= 7:
+        console.print("  [green]✓[/green] Snadno vyslovitelné")
+    elif result.sonority_score < 4:
+        console.print("  [red]✗[/red] Obtížná výslovnost")
+
+    if result.uniqueness_score >= 8:
+        console.print("  [green]✓[/green] Vysoce unikátní název")
+    elif result.uniqueness_score < 5:
+        console.print("  [yellow]![/yellow] Podobné existujícím slovům")
+
+    if result.entropy_score >= 7:
+        console.print("  [green]✓[/green] Dobře vyvážená struktura")
+    elif result.entropy_score < 4:
+        console.print("  [yellow]![/yellow] Příliš repetitivní nebo náhodné")
+
+    # Recommendation
+    console.print()
+    if result.total_score >= 8:
+        console.print("[bold green]Doporučení: Výborný kandidát pro značku![/bold green]")
+    elif result.total_score >= 6:
+        console.print("[bold yellow]Doporučení: Přijatelný kandidát, zvažte alternativy.[/bold yellow]")
+    else:
+        console.print("[bold red]Doporučení: Slabý kandidát, hledejte lepší alternativy.[/bold red]")
+
+
+@cli.command("porovnej")
+@click.argument("nazvy", nargs=-1, required=True)
+@click.pass_context
+def compare_names(ctx: click.Context, nazvy: tuple[str, ...]) -> None:
+    """Porovnej více názvů vedle sebe.
+
+    Zobrazí srovnávací tabulku s fonetickými skóre pro všechny zadané názvy.
+
+    Příklady:
+        brand-gen porovnej Valujo Nextra Zonify
+        brand-gen porovnej Google Apple Amazon
+    """
+    if len(nazvy) < 2:
+        console.print("[red]Zadejte alespoň 2 názvy k porovnání.[/red]")
+        return
+
+    scorer = CombinedPhoneticScorer()
+    results = [(name, scorer.score(name)) for name in nazvy]
+
+    # Sort by total score
+    results.sort(key=lambda x: x[1].total_score, reverse=True)
+
+    table = Table(title="Srovnání názvů")
+    table.add_column("Pořadí", style="dim")
+    table.add_column("Název", style="bold cyan")
+    table.add_column("Celkové", justify="right")
+    table.add_column("Markov", justify="right")
+    table.add_column("Sonorita", justify="right")
+    table.add_column("Entropie", justify="right")
+    table.add_column("Fonotak.", justify="right")
+    table.add_column("Zipf", justify="right")
+    table.add_column("Unikátnost", justify="right")
+
+    for i, (name, result) in enumerate(results, 1):
+        medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else str(i)))
+        score_color = "green" if result.total_score >= 8 else ("yellow" if result.total_score >= 6 else "red")
+        table.add_row(
+            medal,
+            name,
+            f"[{score_color}]{result.total_score:.1f}[/{score_color}]",
+            f"{result.markov_score:.1f}",
+            f"{result.sonority_score:.1f}",
+            f"{result.entropy_score:.1f}",
+            f"{result.phonotactic_score:.1f}",
+            f"{result.zipf_score:.1f}",
+            f"{result.uniqueness_score:.1f}",
+        )
+
+    console.print(table)
+
+    # Winner announcement
+    winner_name, winner_result = results[0]
+    console.print(f"\n[bold green]🏆 Nejlepší kandidát: {winner_name} ({winner_result.total_score:.1f}/10)[/bold green]")
+
+
+@cli.command("modely")
+def show_models_info() -> None:
+    """Zobraz informace o použitých matematických modelech."""
+    console.print("\n[bold]📊 Matematické modely pro hodnocení názvů[/bold]\n")
+
+    models = [
+        (
+            "Markovovy řetězce (Bigram/Trigram)",
+            "Měří přirozenost sekvencí písmen na základě pravděpodobnostního modelu. "
+            "Využívá frekvenční data z přirozených jazyků.",
+            "P(word) = Π P(char_i | char_{i-1})",
+        ),
+        (
+            "Sonority Sequencing Principle (SSP)",
+            "Hodnotí vyslovitelnost na základě zvukové struktury slabik. "
+            "Ideální slabika stoupá v sonorite k jádru (samohlásce) a pak klesá.",
+            "Sonority scale: Stops(1) < Fricatives(3) < Nasals(5) < Liquids(6) < Vowels(10)",
+        ),
+        (
+            "Shannon Entropy",
+            "Měří informační obsah a předvídatelnost. Optimální názvy mají střední entropii - "
+            "nejsou příliš náhodné ani příliš opakující se.",
+            "H(word) = -Σ p(x) × log₂(p(x))",
+        ),
+        (
+            "Phonotactic Probability",
+            "Hodnotí, jak dobře název odpovídá pravidlům zvukových kombinací v jazyce. "
+            "Zahrnuje pozici fonému (začátek, konec) i bifonové pravděpodobnosti.",
+            "PP(word) = P(onset) × P(coda) × Π P(bigram_i)",
+        ),
+        (
+            "Zipfův zákon",
+            "Hodnotí použití běžných vs vzácných fonémů. Slova používající běžnější "
+            "fonémy jsou typicky snáze vyslovitelná a zapamatovatelná.",
+            "f(rank) ∝ 1/rank^α",
+        ),
+        (
+            "Levenshtein Distance",
+            "Měří unikátnost jako minimální editační vzdálenost od existujících slov a značek. "
+            "Vyšší vzdálenost = unikátnější název.",
+            "d(s1, s2) = min(insertions + deletions + substitutions)",
+        ),
+    ]
+
+    for name, desc, formula in models:
+        console.print(Panel(
+            f"[dim]{desc}[/dim]\n\n[cyan]Vzorec:[/cyan] {formula}",
+            title=f"[bold]{name}[/bold]",
+            border_style="blue",
+        ))
+        console.print()
 
 
 def main() -> None:
